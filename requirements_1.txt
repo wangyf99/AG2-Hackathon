@@ -1,0 +1,6 @@
+ag2[gemini,ag-ui]
+openai
+python-dotenv
+httpx
+uvicorn
+fastapi

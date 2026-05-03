@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+ag2[gemini,ag-ui]
+openai
+python-dotenv
