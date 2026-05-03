@@ -4,15 +4,13 @@ All agents are instantiated fresh on every call — no global singletons — so 
 bleeds between HTTP requests. State continuity is carried entirely through context_variables.
 """
 
-from __future__ import annotations
-
 import asyncio
 import functools
 import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Dict, List
 from uuid import uuid4
 
 from ag_ui.core import (
@@ -32,7 +30,6 @@ from autogen.agentchat.contrib.swarm_agent import (
 )
 from autogen.agentchat.group import ContextVariables
 from autogen.agentchat.group.context_expression import ContextExpression
-from autogen.agents.experimental import ReasoningAgent
 
 from engine import BlackjackEngine
 
@@ -452,7 +449,7 @@ def record_shark_advice(advice: str, context_variables: ContextVariables) -> Swa
 # UpdateSystemMessage callables (verbatim from blackjack_tutor.py)
 # ---------------------------------------------------------------------------
 
-def _dealer_updater(agent: ConversableAgent, messages: list) -> str:
+def _dealer_updater(agent: ConversableAgent, messages: list[dict]) -> str:
     cv = agent.context_variables
     return (
         "You are the Blackjack Dealer — neutral, clinical, the game master.\n\n"
@@ -565,31 +562,39 @@ def build_swarm(queue: asyncio.Queue):
     # Wrap all tool functions with StateSnapshot emitters
     wrapped = {fn.__name__: make_stateful_tool(fn, queue) for fn in ALL_TOOL_FNS}
 
+    def _emit_text(name, reply):
+        """Emit SSE text events for any visible agent reply content."""
+        if reply is None:
+            return
+        if isinstance(reply, str):
+            text = reply
+        elif isinstance(reply, dict):
+            text = reply.get("content") or ""
+            # If no content but has tool_calls, emit a tool-activity notice
+            if not text and reply.get("tool_calls"):
+                calls = reply["tool_calls"]
+                names = [c.get("function", {}).get("name", "?") for c in calls]
+                text = f"[calling: {', '.join(names)}]"
+        else:
+            text = str(reply)
+        if text and "TERMINATE" not in text:
+            mid = str(uuid4())
+            ts = int(time.time() * 1000)
+            emit(TextMessageStartEvent(message_id=mid, role="assistant", name=name, timestamp=ts))
+            emit(TextMessageContentEvent(message_id=mid, delta=text, timestamp=ts))
+            emit(TextMessageEndEvent(message_id=mid, timestamp=ts))
+
     class StreamingAgent(ConversableAgent):
         def generate_reply(self, messages=None, sender=None, **kwargs):
             reply = super().generate_reply(messages=messages, sender=sender, **kwargs)
-            content = reply if isinstance(reply, str) else (reply or {}).get("content", "")
-            if content and "TERMINATE" not in str(content):
-                mid = str(uuid4())
-                ts = int(time.time() * 1000)
-                emit(TextMessageStartEvent(
-                    message_id=mid, role="assistant", name=self.name, timestamp=ts))
-                emit(TextMessageContentEvent(message_id=mid, delta=str(content), timestamp=ts))
-                emit(TextMessageEndEvent(message_id=mid, timestamp=ts))
+            _emit_text(self.name, reply)
             return reply
 
-    class StreamingReasoningAgent(ReasoningAgent):
-        def generate_reply(self, messages=None, sender=None, **kwargs):
-            reply = super().generate_reply(messages=messages, sender=sender, **kwargs)
-            content = reply if isinstance(reply, str) else (reply or {}).get("content", "")
-            if content and "TERMINATE" not in str(content):
-                mid = str(uuid4())
-                ts = int(time.time() * 1000)
-                emit(TextMessageStartEvent(
-                    message_id=mid, role="assistant", name=self.name, timestamp=ts))
-                emit(TextMessageContentEvent(message_id=mid, delta=str(content), timestamp=ts))
-                emit(TextMessageEndEvent(message_id=mid, timestamp=ts))
+        async def a_generate_reply(self, messages=None, sender=None, **kwargs):
+            reply = await super().a_generate_reply(messages=messages, sender=sender, **kwargs)
+            _emit_text(self.name, reply)
             return reply
+
 
     dealer = StreamingAgent(
         name="Dealer_Agent",
@@ -602,7 +607,7 @@ def build_swarm(queue: asyncio.Queue):
         llm_config=llm_cfg,
     )
 
-    math_oracle = StreamingReasoningAgent(
+    math_oracle = StreamingAgent(
         name="Math_Oracle",
         system_message=(
             "You are Math_Oracle. Zero personality. Pure logic.\n"
@@ -612,7 +617,6 @@ def build_swarm(queue: asyncio.Queue):
         ),
         functions=[wrapped["run_math_analysis"]],
         llm_config=llm_cfg,
-        reason_config={"method": "beam_search", "max_depth": 2, "beam_size": 2},
     )
 
     safe_player = StreamingAgent(
